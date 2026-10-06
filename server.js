@@ -1,24 +1,25 @@
-// temoin-server — serveur arbitre de « Faux Témoin ».
+// temoin-server — serveur arbitre de « Faux Témoin » (« l'Interrogatoire »).
 //
 // Même forme que les autres serveurs du portfolio (croquis, roquette,
 // qui-ment…) : un seul WebSocket, du JSON, des rooms à code de 4 lettres, et
 // une règle d'or — LE CLIENT N'A AUCUNE AUTORITÉ. Il envoie des intentions
-// (« je déclare : manteau rouge », « je verrouille le suspect 7 ») ;
-// engine.js décide de tout ce qui touche au jeu.
+// (« j'ai répondu », « prêt à voter », « je vote pour Bob ») ; engine.js
+// décide de tout ce qui touche au jeu.
 //
 // Ce fichier ORCHESTRE le moteur, il ne recopie aucune de ses règles :
-//   - une partie = E.createGame() ; déclarations, verrous et départs passent
-//     par E.declare(), E.lock(), E.leave() ;
+//   - une partie = E.createGame() ; tours de parole, votes, dernière chance et
+//     départs passent par E.answered(), E.ready(), E.vote(), E.guess(), E.leave() ;
 //   - UNE minuterie par room, posée sur E.nextDeadline() ; à l'échéance,
 //     E.tick(Date.now()), puis on la repose ;
 //   - les événements du moteur deviennent des messages, et c'est tout.
 //
-// LE COUPABLE ET LES RÔLES SONT LES SECRETS DE CE JEU. Le rôle part joueur par
-// joueur (`role`, même forme pour tous) ; le coupable n'est dans aucun message
-// diffusé avant `case-end`. Les déclarations d'un tour ne sont diffusées qu'à
-// sa révélation, les verrous jamais avant `case-end` (seulement leur nombre).
-// Aucun message ne porte d'horodatage ni d'échéance absolue : `remainingMs`.
-// test.js relit TOUT le fil de chaque client pour le vérifier.
+// LA SCÈNE ET LES RÔLES SONT LES SECRETS DE CE JEU. Le rôle part joueur par
+// joueur (`role`, même forme pour tous) ; la scène aussi (`scene`, au flash :
+// `scene: null` pour le Faux Témoin) ; les 4 versions de la dernière chance
+// au seul Faux Témoin démasqué (`options`). Les votes ne sont diffusés qu'à
+// la révélation (avant : QUI a voté). Aucun message ne porte d'horodatage ni
+// d'échéance absolue : `remainingMs`. test.js relit TOUT le fil de chaque
+// client pour le vérifier.
 //
 // Pas de reprise en pleine partie en V1 (comme croquis) : un joueur qui perd
 // sa connexion est parti, le moteur décide de la suite.
@@ -33,14 +34,19 @@ const PORT = process.env.PORT || 8096;
 const AVATAR_DEFAUT = '🕵️';
 
 // Délais raccourcis : POUR LES TESTS SEULEMENT (personne ne pose ces variables
-// en production ; sans elles, les valeurs du moteur s'appliquent).
+// en production ; sans elles, les valeurs du moteur s'appliquent). La durée du
+// flash, elle, se règle au salon (5, 8 ou 10 s) : TEST_FLASH_MS ne sert qu'à
+// raccourcir les tests.
 const ms = (v) => (Number(v) > 0 ? Number(v) : undefined);
 const REGLES = {
+  roleMs: ms(process.env.TEST_ROLE_MS),
   flashMs: ms(process.env.TEST_FLASH_MS),
-  declareMs: ms(process.env.TEST_DECLARE_MS),
-  deliberateMs: ms(process.env.TEST_DELIBERATE_MS),
-  lastcallMs: ms(process.env.TEST_LASTCALL_MS),
-  resultsMs: ms(process.env.TEST_RESULTS_MS),
+  askMs: process.env.TEST_ASK_MS != null ? Number(process.env.TEST_ASK_MS) : undefined,
+  answerMs: ms(process.env.TEST_ANSWER_MS),
+  debateMs: ms(process.env.TEST_DEBATE_MS),
+  voteMs: ms(process.env.TEST_VOTE_MS),
+  verdictMs: ms(process.env.TEST_VERDICT_MS),
+  guessMs: ms(process.env.TEST_GUESS_MS),
 };
 
 // Débit par connexion, sur une fenêtre d'une seconde.
@@ -67,12 +73,10 @@ const INVISIBLES = new RegExp('[' + [[0x00, 0x1f], [0x7f, 0x9f], [0x200e, 0x200f
 const nettoyer = (s) => String(s == null ? '' : s).replace(INVISIBLES, '').trim();
 
 // ------------------------------------------------------------- ce qui se dit
-const joueur = (room, id) => room.players.find((p) => p.id === id) || null;
-const scores = (v) => v.players;
-
 function lobbyState(room) {
   return {
-    type: 'lobby', code: room.code, phase: room.phase, max: E.MAX_PLAYERS, cases: room.cases,
+    type: 'lobby', code: room.code, phase: room.phase, min: E.MIN_PLAYERS, max: E.MAX_PLAYERS,
+    rounds: room.rounds, flashMs: room.flashMs,
     players: room.players.map((p) => ({ id: p.id, name: p.name, avatar: p.avatar, host: p.id === room.hostId })),
   };
 }
@@ -82,31 +86,35 @@ const identites = (room) => [...room.roster].map(([id, x]) => ({ id, name: x.nam
 function classement(room, ranking) {
   return ranking.map((r) => {
     const p = room.roster.get(r.id);
-    return { id: r.id, name: p.name, avatar: p.avatar, rank: r.rank, score: r.score, found: r.found, left: r.left };
+    return { id: r.id, name: p.name, avatar: p.avatar, rank: r.rank, score: r.score, left: r.left };
   });
 }
 
-// L'état public de l'affaire en cours (sans rien de privé).
+// L'état public de la manche en cours (sans rien de privé). Même forme à
+// chaque phase : le client se redessine à partir de lui.
 function etat(room) {
   const v = E.view(room.game, Date.now());
   return {
-    caseId: v.caseId, cases: v.cases, phase: v.phase, remainingMs: v.remainingMs, durationMs: v.durationMs,
-    liars: v.liars, indic: v.indic, lineup: v.lineup, declared: v.declared, rounds: v.rounds, locked: v.locked,
-    players: scores(v),
+    roundId: v.roundId, rounds: v.rounds, phase: v.phase, remainingMs: v.remainingMs, durationMs: v.durationMs,
+    title: v.title, question: v.question, asked: v.asked, ready: v.ready, voted: v.voted,
+    verdict: v.verdict, liar: v.liar, reveal: v.reveal, players: v.players,
   };
 }
 
-// L'état complet, pour UN joueur : au lancement et à la demande. Le rôle (son
-// fragment, ou le coupable pour un Faux Témoin) n'est que le sien.
+// L'état complet, pour UN joueur, à la demande. Son rôle, et la scène ou les
+// 4 versions seulement si le moteur les lui donnerait à cet instant.
 function snapshot(room, p) {
-  const v = E.view(room.game, Date.now());
+  const g = room.game;
+  const v = E.view(g, Date.now());
+  const sc = E.sceneView(g, p.id);
+  const op = E.optionsView(g, p.id);
   return {
-    type: 'snapshot', code: room.code, you: p.id, host: room.hostId,
-    attrs: E.ATTRS.map((a) => ({ id: a.id, values: a.values.slice() })),
+    type: 'snapshot', code: room.code, you: p.id, host: room.hostId, flashMs: g.flashMs,
     identities: identites(room),
     ...etat(room),
-    role: E.roleView(room.game, p.id),
-    audit: v.audit,
+    role: E.roleView(g, p.id),
+    scene: sc ? sc.scene : null,
+    options: op ? op.options : null,
     complete: v.complete,
     ranking: v.ranking ? classement(room, v.ranking) : null,
   };
@@ -115,35 +123,43 @@ function snapshot(room, p) {
 // Les événements du moteur → les messages. Rien n'est inventé ici.
 function diffuser(room, events) {
   const g = room.game;
+  // Plusieurs phases dans un même lot (tours de parole enchaînés, fin
+  // anticipée) : seule la DERNIÈRE est diffusée, avec l'état du moment.
+  const dernierePhase = [...events].reverse().find((e) => e.type === 'phase');
   for (const e of events) {
-    if (e.type === 'case') {
-      if (g.caseId !== e.caseId) continue;       // affaire déjà dépassée dans ce même lot
-      const s = etat(room);
-      broadcast(room, { type: 'case', ...s });
-      // Le rôle : joueur par joueur. C'est LE message à ne jamais diffuser.
+    if (e.type === 'round') {
+      if (g.roundId !== e.roundId) continue;
+      broadcast(room, { type: 'round', roundId: g.roundId, rounds: g.rounds, title: g.round.title, players: E.view(g).players });
+      // Le rôle : joueur par joueur. Même forme pour tous.
       room.players.forEach((p) => {
         const r = E.roleView(g, p.id);
         if (r) send(p.ws, { type: 'role', ...r });
       });
     } else if (e.type === 'phase') {
-      if (g.caseId !== e.caseId || g.phase !== e.phase) continue;
-      const s = etat(room);
-      broadcast(room, { type: 'phase', caseId: s.caseId, phase: s.phase, remainingMs: s.remainingMs, durationMs: s.durationMs, rounds: s.rounds, locked: s.locked });
-    } else if (e.type === 'declared') {
-      if (g.caseId !== e.caseId || !['declare1', 'declare2'].includes(g.phase)) continue;
-      broadcast(room, { type: 'declared', caseId: e.caseId, declared: E.view(g).declared });
-    } else if (e.type === 'locked') {
-      if (g.caseId !== e.caseId || g.phase === 'results' || g.phase === 'end') continue;
-      broadcast(room, { type: 'locked', caseId: e.caseId, locked: E.view(g).locked });
-    } else if (e.type === 'results') {
-      if (g.caseId !== e.caseId || g.phase !== 'results') continue;
-      const v = E.view(g, Date.now());
-      broadcast(room, {
-        type: 'case-end', caseId: v.caseId, cases: v.cases, audit: v.audit, rounds: v.rounds,
-        players: scores(v), remainingMs: v.remainingMs, last: v.caseId >= v.cases,
-      });
+      if (e !== dernierePhase || g.roundId !== e.roundId || g.phase !== e.phase) continue;
+      broadcast(room, { type: 'phase', ...etat(room) });
+      // LA SCÈNE, joueur par joueur, au flash (le Faux Témoin : `scene: null`).
+      if (g.phase === 'flash') {
+        room.players.forEach((p) => {
+          const sc = E.sceneView(g, p.id);
+          if (sc) send(p.ws, { type: 'scene', ...sc });
+        });
+      }
+      // LES 4 VERSIONS, au seul Faux Témoin démasqué.
+      if (g.phase === 'guess') {
+        room.players.forEach((p) => {
+          const op = E.optionsView(g, p.id);
+          if (op) send(p.ws, { type: 'options', ...op });
+        });
+      }
+    } else if (e.type === 'ready') {
+      if (g.roundId !== e.roundId || g.phase !== 'debate') continue;
+      broadcast(room, { type: 'ready', roundId: e.roundId, ready: E.view(g).ready });
+    } else if (e.type === 'voted') {
+      if (g.roundId !== e.roundId || g.phase !== 'vote') continue;
+      broadcast(room, { type: 'voted', roundId: e.roundId, voted: E.view(g).voted });
     } else if (e.type === 'left') {
-      broadcast(room, { type: 'left', id: e.id, host: room.hostId, players: scores(E.view(g)) });
+      broadcast(room, { type: 'left', id: e.id, host: room.hostId, players: E.view(g).players });
     } else if (e.type === 'end') {
       terminer(room, e);
     }
@@ -178,22 +194,31 @@ function echeance(room) {
 function lancer(room) {
   room.game = E.createGame({
     players: room.players.map((p) => p.id),
-    cases: room.cases,
+    rounds: room.rounds,
+    flashMs: room.flashMs,
     now: Date.now(),
     random: Math.random,
     regles: REGLES,
   });
   room.roster = new Map(room.players.map((p) => [p.id, { name: p.name, avatar: p.avatar }]));
   room.phase = 'playing';
-  // L'identité de tous et le vocabulaire, une fois ; puis la première affaire
-  // (et le rôle de chacun, à lui seul).
+  // L'identité de tous, une fois ; puis la première manche (et le rôle de
+  // chacun, à lui seul).
   room.players.forEach((p) => send(p.ws, {
-    type: 'game', code: room.code, you: p.id, host: room.hostId, cases: room.game.cases,
-    attrs: E.ATTRS.map((a) => ({ id: a.id, values: a.values.slice() })),
+    type: 'game', code: room.code, you: p.id, host: room.hostId, rounds: room.game.rounds, flashMs: room.game.flashMs,
     identities: identites(room),
   }));
   diffuser(room, room.game.startEvents);
   planifier(room);
+}
+
+// Le réglage de l'hôte : rend un message d'erreur, ou null (et applique).
+function regler(room, msg) {
+  if (msg.rounds !== undefined && !E.ROUNDS.includes(msg.rounds)) return `nombre de manches : ${E.ROUNDS.join(', ')}`;
+  if (msg.flashMs !== undefined && !E.FLASHES.includes(msg.flashMs)) return `durée du flash : ${E.FLASHES.map((x) => x / 1000).join(', ')} s`;
+  if (msg.rounds !== undefined) room.rounds = msg.rounds;
+  if (msg.flashMs !== undefined) room.flashMs = msg.flashMs;
+  return null;
 }
 
 function debit(ws) {
@@ -219,19 +244,27 @@ const presence = presenceJoueurs.attach(wss);
 wss.on('connection', (ws) => {
   let room = null, me = null;
   const fail = (message) => send(ws, { type: 'error', message });
-  const refuser = (action, caseId, reason) => send(ws, {
-    type: 'refused', action, caseId: Number.isInteger(caseId) ? caseId : null, reason, message: REFUS[reason] || reason,
+  const refuser = (action, roundId, reason) => send(ws, {
+    type: 'refused', action: typeof action === 'string' ? action : null, roundId: Number.isInteger(roundId) ? roundId : null,
+    reason, message: REFUS[reason] || reason,
   });
   // Une trame trop grosse fait émettre `error` au socket, puis `ws` le ferme ;
   // sans cet écouteur, l'erreur non traitée ferait tomber TOUT le serveur.
   ws.on('error', () => {});
+
+  // Une action de jeu : le moteur répond { ok, reason, events }.
+  const jouer = (a, roundId, r) => {
+    diffuser(room, r.events);
+    if (!r.ok) refuser(a, roundId, r.reason);
+    planifier(room);
+  };
 
   ws.on('message', (raw) => {
     let msg;
     try { msg = JSON.parse(raw); } catch (_) { return fail('message illisible'); }
     if (!msg || typeof msg !== 'object') return fail('message illisible');
     if (presence.consume(ws, msg)) return;   // { action: 'presence' } : jamais « pas encore dans une partie »
-    if (!debit(ws)) return refuser(msg.action, msg.caseId, 'TOO_FAST');
+    if (!debit(ws)) return refuser(msg.action, msg.roundId, 'TOO_FAST');
     const a = msg.action;
 
     if (a === 'join') {
@@ -247,11 +280,11 @@ wss.on('connection', (ws) => {
         if (r.players.length >= E.MAX_PLAYERS) return fail('partie complète');
       } else {
         const c = nouveauCode();
-        r = { code: c, players: [], hostId: null, phase: 'lobby', cases: E.DEFAULT_CASES, game: null, roster: null, timer: null };
+        r = { code: c, players: [], hostId: null, phase: 'lobby', rounds: E.DEFAULT_ROUNDS, flashMs: E.DEFAULT_FLASH, game: null, roster: null, timer: null };
         rooms.set(c, r);
       }
       let id;
-      do { id = Math.random().toString(36).slice(2, 9); } while (id === E.INDIC || r.players.some((p) => p.id === id));
+      do { id = Math.random().toString(36).slice(2, 9); } while (r.players.some((p) => p.id === id));
       room = r;
       me = { id, ws, name, avatar };
       room.players.push(me);
@@ -265,11 +298,11 @@ wss.on('connection', (ws) => {
 
     if (!room || !me) return fail('pas encore dans une partie');
 
-    if (a === 'cases') {
+    if (a === 'settings') {
       if (me.id !== room.hostId) return fail("seul l'hôte règle la partie");
       if (room.phase === 'playing') return;
-      if (!E.CASES.includes(msg.cases)) return fail(`nombre d'affaires : ${E.CASES.join(', ')}`);
-      room.cases = msg.cases;
+      const err = regler(room, msg);
+      if (err) return fail(err);
       return broadcast(room, lobbyState(room));
     }
 
@@ -277,10 +310,8 @@ wss.on('connection', (ws) => {
       if (me.id !== room.hostId) return fail("seul l'hôte lance la partie");
       if (room.phase === 'playing') return fail('partie déjà en cours');
       if (room.players.length < E.MIN_PLAYERS) return fail(`il faut au moins ${E.MIN_PLAYERS} joueurs`);
-      if (msg.cases !== undefined) {
-        if (!E.CASES.includes(msg.cases)) return fail(`nombre d'affaires : ${E.CASES.join(', ')}`);
-        room.cases = msg.cases;
-      }
+      const err = regler(room, msg);
+      if (err) return fail(err);
       return lancer(room);                  // depuis le salon, ou la fin (revanche)
     }
 
@@ -298,28 +329,19 @@ wss.on('connection', (ws) => {
       return send(ws, snapshot(room, me));
     }
 
-    if (a === 'declare') {
-      if (room.phase !== 'playing') return refuser(a, msg.caseId, 'NOT_PLAYING');
-      const decl = msg.pass === true ? null : { attr: msg.attr, value: msg.value };
-      const r = E.declare(room.game, me.id, msg.caseId, decl, Date.now());
-      diffuser(room, r.events);
-      if (!r.ok) refuser(a, msg.caseId, r.reason);
-      return planifier(room);
-    }
-
-    if (a === 'lock') {
-      if (room.phase !== 'playing') return refuser(a, msg.caseId, 'NOT_PLAYING');
-      const r = E.lock(room.game, me.id, msg.caseId, msg.suspect, msg.accuse, Date.now());
-      diffuser(room, r.events);
-      if (!r.ok) refuser(a, msg.caseId, r.reason);
-      return planifier(room);
+    if (['answered', 'ready', 'vote', 'guess'].includes(a)) {
+      if (room.phase !== 'playing') return refuser(a, msg.roundId, 'NOT_PLAYING');
+      const g = room.game, now = Date.now();
+      if (a === 'answered') return jouer(a, msg.roundId, E.answered(g, me.id, msg.roundId, now));
+      if (a === 'ready') return jouer(a, msg.roundId, E.ready(g, me.id, msg.roundId, msg.ready !== false, now));
+      if (a === 'vote') return jouer(a, msg.roundId, E.vote(g, me.id, msg.roundId, msg.target, now));
+      return jouer(a, msg.roundId, E.guess(g, me.id, msg.roundId, msg.option, now));
     }
 
     if (a === 'next') {
       if (me.id !== room.hostId) return fail("seul l'hôte fait avancer");
       if (room.phase !== 'playing') return;
-      diffuser(room, E.next(room.game, Date.now()));
-      return planifier(room);
+      return jouer(a, room.game.roundId, E.next(room.game, Date.now()));
     }
 
     fail('action inconnue');
