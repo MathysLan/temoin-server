@@ -1,7 +1,7 @@
 // Outils communs aux tests WebSocket de ce dépôt (test.js, test-16.js). Pas un
 // test : un client qui garde TOUT ce qu'il reçoit, des attentes sur condition
 // (jamais de délai fixe), et l'inspecteur de fil qui vérifie champ par champ
-// qu'aucun message ne trahit le coupable, un rôle ou un verrou.
+// qu'aucun message ne trahit la scène, un rôle, les versions ou un vote.
 'use strict';
 const WebSocket = require('ws');
 
@@ -65,39 +65,34 @@ async function attendre(cond, ms = 5000) {
 }
 
 // ----------------------------------------------------------------- robot
-// Un témoin honnête et pressé : il déclare ce qu'il a vu (son 1er puis son
-// dernier attribut), puis, à la révélation 1, verrouille le premier suspect
-// compatible avec son fragment ET les déclarations révélées qu'il croit (celles
-// qui ne contredisent pas son fragment). Un Faux Témoin déclare faux et
-// verrouille n'importe qui. Le robot n'utilise que ce que SON client a reçu.
+// Un joueur pressé : il rend la parole dès qu'il l'a (« J'ai répondu »), se
+// dit prêt au débat, vote, et choisit une version s'il est démasqué. Il
+// n'utilise que ce que SON client a reçu ; le TEST peut lui souffler son vote
+// (`vote(phase, robot)` → id) ou son choix (`guess(options)` → index), par
+// exemple d'après la vérité relevée côté serveur, pour jouer un scénario.
 function robot(c, o = {}) {
-  const opts = { verrou: true, declarer: true, ...o };
-  let role = null, kase = null;
+  const opts = { repondre: true, pret: true, voter: true, ...o };
+  let role = null;
   c.on((m) => {
     if (opts.off) return;
-    if (m.type === 'case') { kase = m; role = null; }
-    else if (m.type === 'role') role = m;
-    else if (m.type === 'phase' && kase && m.caseId === kase.caseId) {
-      if (!role) return;
-      if ((m.phase === 'declare1' || m.phase === 'declare2') && opts.declarer) {
-        const f = m.phase === 'declare1' ? role.fragment[0] : role.fragment[role.fragment.length - 1];
-        let d = { attr: f.attr, value: f.value };
-        if (role.role === 'liar') {
-          const a = c.attrs.find((x) => x.id === f.attr);
-          d = { attr: f.attr, value: a.values.find((v) => v !== f.value) };
-        }
-        setTimeout(() => c.send({ action: 'declare', caseId: m.caseId, ...d }), 5);
+    if (m.type === 'role') role = m;
+    else if (m.type === 'game') c.joueurs = m.identities.map((x) => x.id);
+    else if (m.type === 'phase') {
+      if (m.phase === 'question' && m.question.speaker === c.id && opts.repondre) {
+        setTimeout(() => c.send({ action: 'answered', roundId: m.roundId }), 5);
+      } else if (m.phase === 'debate' && opts.pret) {
+        setTimeout(() => c.send({ action: 'ready', roundId: m.roundId }), 5);
+      } else if (m.phase === 'vote' && opts.voter) {
+        const presents = m.players.filter((p) => !p.left && p.id !== c.id).map((p) => p.id);
+        const cible = opts.vote ? opts.vote(m, c, role) : presents[Math.floor(Math.random() * presents.length)];
+        if (cible) setTimeout(() => c.send({ action: 'vote', roundId: m.roundId, target: cible }), 5);
+      } else if (m.phase === 'reveal' && opts.suivant && m.reveal) {
+        setTimeout(() => c.send({ action: 'next' }), opts.suivant);
       }
-      if (m.phase === 'declare2' && opts.verrou) {
-        const mien = new Map(role.fragment.map((f) => [f.attr, f.value]));
-        const croyables = m.rounds.flatMap((r) => r.declarations).filter((d) => !d.pass && (!mien.has(d.attr) || mien.get(d.attr) === d.value));
-        const ok = (s) => [...mien].every(([a, v]) => s[a] === v);
-        const score = (s) => croyables.filter((d) => s[d.attr] === d.value).length;
-        let best = -1, choix = 0;
-        kase.lineup.forEach((s, i) => { if ((role.role === 'liar' || ok(s)) && score(s) > best) { best = score(s); choix = i; } });
-        setTimeout(() => c.send({ action: 'lock', caseId: m.caseId, suspect: choix }), 10);
-      }
-    } else if (m.type === 'game') c.attrs = m.attrs;
+    } else if (m.type === 'options') {
+      const choix = opts.guess ? opts.guess(m.options, c) : 0;
+      setTimeout(() => c.send({ action: 'guess', roundId: m.roundId, option: choix }), 5);
+    }
   });
   return c;
 }
@@ -106,46 +101,51 @@ function robot(c, o = {}) {
 // Chaque type de message a ses champs, et seulement eux. Un champ de plus —
 // « juste pour l'affichage » — c'est typiquement par là qu'un secret finit par
 // fuiter : le test refuse tout champ inconnu.
+const ETAT = ['roundId', 'rounds', 'phase', 'remainingMs', 'durationMs', 'title', 'question', 'asked', 'ready', 'voted', 'verdict', 'liar', 'reveal', 'players'];
 const CHAMPS = {
   presence: ['type', 'n', 'cle', 'remplace'],
   you: ['type', 'id', 'code', 'host'],
-  lobby: ['type', 'code', 'phase', 'max', 'cases', 'players'],
-  game: ['type', 'code', 'you', 'host', 'cases', 'attrs', 'identities'],
-  case: ['type', 'caseId', 'cases', 'phase', 'remainingMs', 'durationMs', 'liars', 'indic', 'lineup', 'declared', 'rounds', 'locked', 'players'],
-  role: ['type', 'caseId', 'role', 'fragment', 'culprit'],
-  phase: ['type', 'caseId', 'phase', 'remainingMs', 'durationMs', 'rounds', 'locked'],
-  declared: ['type', 'caseId', 'declared'],
-  locked: ['type', 'caseId', 'locked'],
-  'case-end': ['type', 'caseId', 'cases', 'audit', 'rounds', 'players', 'remainingMs', 'last'],
+  lobby: ['type', 'code', 'phase', 'min', 'max', 'rounds', 'flashMs', 'players'],
+  game: ['type', 'code', 'you', 'host', 'rounds', 'flashMs', 'identities'],
+  round: ['type', 'roundId', 'rounds', 'title', 'players'],
+  role: ['type', 'roundId', 'role'],
+  phase: ['type', ...ETAT],
+  scene: ['type', 'roundId', 'scene'],
+  options: ['type', 'roundId', 'options'],
+  ready: ['type', 'roundId', 'ready'],
+  voted: ['type', 'roundId', 'voted'],
   left: ['type', 'id', 'host', 'players'],
   results: ['type', 'complete', 'host', 'ranking'],
-  snapshot: ['type', 'code', 'you', 'host', 'attrs', 'identities', 'caseId', 'cases', 'phase', 'remainingMs', 'durationMs', 'liars', 'indic',
-    'lineup', 'declared', 'rounds', 'locked', 'players', 'role', 'audit', 'complete', 'ranking'],
-  refused: ['type', 'action', 'caseId', 'reason', 'message'],
+  snapshot: ['type', 'code', 'you', 'host', 'flashMs', 'identities', ...ETAT, 'role', 'scene', 'options', 'complete', 'ranking'],
+  refused: ['type', 'action', 'roundId', 'reason', 'message'],
   error: ['type', 'message'],
 };
 const SOUS = {
   players: ['id', 'name', 'avatar', 'host', 'score', 'left'],
   identities: ['id', 'name', 'avatar', 'host'],
-  ranking: ['id', 'name', 'avatar', 'rank', 'score', 'found', 'left'],
-  rounds: ['round', 'declarations', 'summary'],
-  declarations: ['id', 'attr', 'value', 'pass', 'round', 'truth'],
-  liars: ['min', 'max'],
+  ranking: ['id', 'name', 'avatar', 'rank', 'score', 'left'],
+  question: ['index', 'count', 'text', 'famille', 'order', 'speaker', 'answered'],
+  verdict: ['accused', 'tie', 'caught'],
+  reveal: ['liar', 'scene', 'aborted', 'votes', 'verdict', 'options', 'answer', 'guess', 'points'],
+  votes: ['id', 'target'],
+  points: ['id', 'points'],
+  scene: ['place', 'title', 'items'],
+  options: ['place', 'title', 'items'],
+  items: ['slot', 'zone', 'item'],
   avatar: ['kind', 'emoji', 'src'],
-  attrs: ['id', 'values'],
-  fragment: ['attr', 'value'],
-  audit: ['culprit', 'liars', 'fragments', 'declarations', 'locks', 'points'],
-  role: ['caseId', 'role', 'fragment', 'culprit'],
+  role: ['roundId', 'role'],
 };
 // Sur les NOMS de champs : l'état interne du moteur n'a rien à faire sur le fil.
-const CLES_INTERDITES = /endsat|deadline|^at$|timestamp|witnesses|liartimes|random|indicplan|^range$|^kase$/i;
-// Ce qui n'a le droit d'apparaître QUE dans l'audit (case-end, snapshot aux
-// résultats) ou dans le rôle d'un joueur.
-const SECRETS = /^(culprit|fragments?|truth|suspect|accuse|accusecorrect|correct|locks|liar|points)$/i;
-const MAX_DUREE = 20000;
+const CLES_INTERDITES = /endsat|deadline|^at$|timestamp|liartimes|random|^round$|^qi$|^si$|vraie|^lu$/i;
+// Ce qui n'a le droit d'apparaître QUE dans la révélation (`reveal`), dans la
+// scène d'un témoin (`scene`, au flash) ou dans les versions du Faux Témoin
+// démasqué (`options`).
+const SECRETS = /^(scene|items|item|options|answer|votes|target|guess|points)$/i;
+const MAX_DUREE = 100000;   // un délai (≤ 90 s de débat), jamais un instant
 
-// Rend la liste des écarts (vide = fil propre). `verite(caseId, id)` : le rôle
-// relevé CÔTÉ SERVEUR ({ role, fragment, culprit }) pour vérifier `role`.
+// Rend la liste des écarts (vide = fil propre). `verite(roundId, id, n)` : ce
+// que le SERVEUR savait de cette manche ({ role, liar, scene, options }) ; `n`
+// compte les parties (la revanche repart à la manche 1).
 function inspecterFil(c, verite) {
   const ecarts = [];
   const objet = (o, champs, ou) => { for (const k of Object.keys(o)) if (!champs.includes(k)) ecarts.push(`${ou} : champ inattendu « ${k} »`); };
@@ -159,35 +159,51 @@ function inspecterFil(c, verite) {
     if (SOUS[cle]) objet(o, SOUS[cle], `${ou} ${cle}`);
     for (const [k, v] of Object.entries(o)) {
       if (CLES_INTERDITES.test(k)) ecarts.push(`${ou} : champ interdit « ${k} »`);
-      if (!secretOk && SECRETS.test(k)) ecarts.push(`${ou} : secret « ${k} » hors audit`);
-      // Dans `summary`, les clés sont des attributs puis des valeurs : pas de sous-schéma.
-      if (cle === 'summary') continue;
-      parcourir(v, ou, k, secretOk || k === 'audit' || k === 'role');
+      if (!secretOk && SECRETS.test(k)) ecarts.push(`${ou} : secret « ${k} » hors révélation`);
+      // Un élément de scène : ses clés sont celles du vocabulaire du dessin.
+      if (k === 'item') continue;
+      parcourir(v, ou, k, secretOk || k === 'reveal');
     }
   };
+  let partie = 0;
   c.msgs.forEach((m, i) => {
     const ou = `${c.nom} #${i} ${m.type}`;
     const champs = CHAMPS[m.type];
     if (!champs) { ecarts.push(`${ou} : type inconnu`); return; }
+    if (m.type === 'game') partie += 1;
     objet(m, champs, ou);
-    const permis = m.type === 'role';
+    // `scene` et `options` sont leurs propres messages privés : vérifiés à part.
+    const prive = m.type === 'scene' || m.type === 'options';
     for (const [k, v] of Object.entries(m)) {
       if (CLES_INTERDITES.test(k)) ecarts.push(`${ou} : champ interdit « ${k} »`);
-      if (!permis && SECRETS.test(k)) ecarts.push(`${ou} : secret « ${k} » hors audit`);
-      parcourir(v, ou, k, permis || k === 'audit' || k === 'role');
+      const ok = prive || (m.type === 'snapshot' && (k === 'scene' || k === 'options')) || k === 'reveal';
+      if (!ok && SECRETS.test(k)) ecarts.push(`${ou} : secret « ${k} » hors révélation`);
+      parcourir(v, ou, k, ok);
     }
-    // Le rôle : celui que le serveur a tiré pour CE joueur, et rien d'autre.
-    const r = m.type === 'role' ? m : m.type === 'snapshot' ? m.role : null;
-    if (r && verite) {
-      const v = verite(r.caseId, c.id);
-      if (!v) ecarts.push(`${ou} : rôle sans vérité côté serveur`);
-      else if (r.role !== v.role || JSON.stringify(r.fragment) !== JSON.stringify(v.fragment) || r.culprit !== v.culprit) ecarts.push(`${ou} : rôle différent de celui du serveur`);
-      if (r.role !== 'liar' && r.culprit !== null) ecarts.push(`${ou} : un témoin reçoit le coupable`);
+    // L'identité du Faux Témoin : seulement une fois démasqué, ou à la révélation.
+    if ((m.type === 'phase' || m.type === 'snapshot') && m.liar != null && m.phase !== 'guess') ecarts.push(`${ou} : Faux Témoin nommé hors dernière chance`);
+    if ((m.type === 'phase' || m.type === 'snapshot') && m.reveal != null && m.phase !== 'reveal') ecarts.push(`${ou} : révélation avant l'heure`);
+    if ((m.type === 'phase' || m.type === 'snapshot') && m.verdict != null && !['verdict', 'guess', 'reveal'].includes(m.phase)) ecarts.push(`${ou} : verdict avant l'heure`);
+    if (!verite) return;
+    const v = (rid) => verite(rid, c.id, partie);
+    if (m.type === 'role') {
+      const x = v(m.roundId);
+      if (!x) ecarts.push(`${ou} : rôle sans vérité côté serveur`);
+      else if (m.role !== (x.liar === c.id ? 'liar' : 'witness')) ecarts.push(`${ou} : rôle différent de celui du serveur`);
     }
-    // Un snapshot ne porte l'audit qu'aux résultats.
-    if (m.type === 'snapshot' && m.audit && m.phase !== 'results' && m.phase !== 'end') ecarts.push(`${ou} : audit hors résultats`);
-    // Une déclaration avec sa vérité n'existe que dans l'audit.
-    if ((m.type === 'phase' || m.type === 'case') && m.rounds.some((r) => r.declarations.some((d) => 'truth' in d))) ecarts.push(`${ou} : vérité d'une déclaration`);
+    if (m.type === 'scene') {
+      const x = v(m.roundId);
+      if (!x) ecarts.push(`${ou} : scène sans vérité côté serveur`);
+      else if (x.liar === c.id && m.scene !== null) ecarts.push(`${ou} : LE FAUX TÉMOIN REÇOIT LA SCÈNE`);
+      else if (x.liar !== c.id && JSON.stringify(m.scene) !== JSON.stringify(x.scene)) ecarts.push(`${ou} : scène différente de celle du serveur`);
+    }
+    if (m.type === 'options') {
+      const x = v(m.roundId);
+      if (!x || x.liar !== c.id) ecarts.push(`${ou} : versions reçues par un autre que le Faux Témoin`);
+      else if (JSON.stringify(m.options) !== JSON.stringify(x.options)) ecarts.push(`${ou} : versions différentes de celles du serveur`);
+    }
+    if (m.type === 'snapshot' && m.scene && m.phase !== 'flash') ecarts.push(`${ou} : scène hors flash`);
+    if (m.type === 'snapshot' && m.options && m.phase !== 'guess') ecarts.push(`${ou} : versions hors dernière chance`);
   });
   return ecarts;
 }

@@ -1,5 +1,5 @@
 # Déploiement Render, même forme que les autres serveurs du portfolio.
-# (Pas encore déployé : lot serveur seulement.)
+# Déployé par Mathys (redéploiement à chaque push sur main).
 services:
   - type: web
     name: temoin-server

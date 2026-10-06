@@ -1,6 +1,6 @@
 {
   "name": "temoin-server",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Serveur arbitre du jeu « Faux Témoin » (portfolio Mathys Langiny).",
   "private": true,
   "main": "server.js",
